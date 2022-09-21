@@ -1,56 +1,85 @@
-# pylint: disable=wildcard-import, unused-wildcard-import
-"""
-This code file mainly comes from https://github.com/dmlc/gluon-cv/blob/master/gluoncv/model_zoo/model_zoo.py
-"""
-from .face_recognition import *
-from .face_detection import *
-from .face_genderage import *
-#from .face_alignment import *
+# -*- coding: utf-8 -*-
+# @Organization  : insightface.ai
+# @Author        : Jia Guo
+# @Time          : 2021-05-04
+# @Function      : 
 
-__all__ = ['get_model', 'get_model_list']
+import os
+import os.path as osp
+import glob
+import onnxruntime
+from .arcface_onnx import *
+from .retinaface import *
+#from .scrfd import *
+from .landmark import *
+from .attribute import Attribute
+from ..utils import download_onnx
 
-_models = {
-    'arcface_r100_v1': arcface_r100_v1,
-    #'arcface_mfn_v1': arcface_mfn_v1,
-    #'arcface_outofreach_v1': arcface_outofreach_v1,
-    'retinaface_r50_v1': retinaface_r50_v1,
-    'retinaface_mnet025_v1': retinaface_mnet025_v1,
-    'retinaface_mnet025_v2': retinaface_mnet025_v2,
-    'genderage_v1': genderage_v1,
-}
+__all__ = ['get_model']
 
+
+class PickableInferenceSession(onnxruntime.InferenceSession): 
+    # This is a wrapper to make the current InferenceSession class pickable.
+    def __init__(self, model_path, **kwargs):
+        super().__init__(model_path, **kwargs)
+        self.model_path = model_path
+
+    def __getstate__(self):
+        return {'model_path': self.model_path}
+
+    def __setstate__(self, values):
+        model_path = values['model_path']
+        self.__init__(model_path)
+
+class ModelRouter:
+    def __init__(self, onnx_file):
+        self.onnx_file = onnx_file
+
+    def get_model(self, **kwargs):
+        session = PickableInferenceSession(self.onnx_file, **kwargs)
+        print(f'Applied providers: {session._providers}, with options: {session._provider_options}')
+        input_cfg = session.get_inputs()[0]
+        input_shape = input_cfg.shape
+        outputs = session.get_outputs()
+
+        if len(outputs)>=5:
+            return RetinaFace(model_file=self.onnx_file, session=session)
+        elif input_shape[2]==112 and input_shape[3]==112:
+            return ArcFaceONNX(model_file=self.onnx_file, session=session)
+        elif input_shape[2]==192 and input_shape[3]==192:
+            return Landmark(model_file=self.onnx_file, session=session)
+        elif input_shape[2]==96 and input_shape[3]==96:
+            return Attribute(model_file=self.onnx_file, session=session)
+        else:
+            #raise RuntimeError('error on model routing')
+            return None
+
+def find_onnx_file(dir_path):
+    if not os.path.exists(dir_path):
+        return None
+    paths = glob.glob("%s/*.onnx" % dir_path)
+    if len(paths) == 0:
+        return None
+    paths = sorted(paths)
+    return paths[-1]
 
 def get_model(name, **kwargs):
-    """Returns a pre-defined model by name
+    root = kwargs.get('root', '~/.insightface')
+    root = os.path.expanduser(root)
+    model_root = osp.join(root, 'models')
+    allow_download = kwargs.get('download', False)
+    if not name.endswith('.onnx'):
+        model_dir = os.path.join(model_root, name)
+        model_file = find_onnx_file(model_dir)
+        if model_file is None:
+            return None
+    else:
+        model_file = name
+    if not osp.exists(model_file) and allow_download:
+        model_file = download_onnx('models', model_file, root=root)
+    assert osp.exists(model_file), 'model_file should exist'
+    assert osp.isfile(model_file), 'model_file should be file'
+    router = ModelRouter(model_file)
+    model = router.get_model(providers=kwargs.get('providers'), provider_options=kwargs.get('provider_options'))
+    return model
 
-    Parameters
-    ----------
-    name : str
-        Name of the model.
-    root : str, default '~/.insightface/models'
-        Location for keeping the model parameters.
-
-    Returns
-    -------
-    Model
-        The model.
-    """
-    name = name.lower()
-    if name not in _models:
-        err_str = '"%s" is not among the following model list:\n\t' % (name)
-        err_str += '%s' % ('\n\t'.join(sorted(_models.keys())))
-        raise ValueError(err_str)
-    net = _models[name](**kwargs)
-    return net
-
-
-def get_model_list():
-    """Get the entire list of model names in model_zoo.
-
-    Returns
-    -------
-    list of str
-        Entire list of model names in model_zoo.
-
-    """
-    return sorted(_models.keys())

@@ -1,9 +1,5 @@
 tensorboard
 easydict
+mxnet
+onnx
 sklearn
-matplotlib
-pandas
-scikit-image
-menpo
-prettytable
-mxnet==1.6.0
