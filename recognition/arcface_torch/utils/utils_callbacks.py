@@ -7,19 +7,22 @@ import torch
 
 from eval import verification
 from utils.utils_logging import AverageMeter
-from partial_fc import PartialFC
+from torch.utils.tensorboard import SummaryWriter
+from torch import distributed
 
 
 class CallBackVerification(object):
-    def __init__(self, frequent, rank, val_targets, rec_prefix, image_size=(112, 112)):
-        self.frequent: int = frequent
-        self.rank: int = rank
+    
+    def __init__(self, val_targets, rec_prefix, summary_writer=None, image_size=(112, 112)):
+        self.rank: int = distributed.get_rank()
         self.highest_acc: float = 0.0
         self.highest_acc_list: List[float] = [0.0] * len(val_targets)
         self.ver_list: List[object] = []
         self.ver_name_list: List[str] = []
         if self.rank is 0:
             self.init_dataset(val_targets=val_targets, data_dir=rec_prefix, image_size=image_size)
+
+        self.summary_writer = summary_writer
 
     def ver_test(self, backbone: torch.nn.Module, global_step: int):
         results = []
@@ -28,6 +31,10 @@ class CallBackVerification(object):
                 self.ver_list[i], backbone, 10, 10)
             logging.info('[%s][%d]XNorm: %f' % (self.ver_name_list[i], global_step, xnorm))
             logging.info('[%s][%d]Accuracy-Flip: %1.5f+-%1.5f' % (self.ver_name_list[i], global_step, acc2, std2))
+
+            self.summary_writer: SummaryWriter
+            self.summary_writer.add_scalar(tag=self.ver_name_list[i], scalar_value=acc2, global_step=global_step, )
+
             if acc2 > self.highest_acc_list[i]:
                 self.highest_acc_list[i] = acc2
             logging.info(
@@ -43,27 +50,34 @@ class CallBackVerification(object):
                 self.ver_name_list.append(name)
 
     def __call__(self, num_update, backbone: torch.nn.Module):
-        if self.rank is 0 and num_update > 0 and num_update % self.frequent == 0:
+        if self.rank is 0 and num_update > 0:
             backbone.eval()
             self.ver_test(backbone, num_update)
             backbone.train()
 
 
 class CallBackLogging(object):
-    def __init__(self, frequent, rank, total_step, batch_size, world_size, writer=None):
+    def __init__(self, frequent, total_step, batch_size, start_step=0,writer=None):
         self.frequent: int = frequent
-        self.rank: int = rank
+        self.rank: int = distributed.get_rank()
+        self.world_size: int = distributed.get_world_size()
         self.time_start = time.time()
         self.total_step: int = total_step
+        self.start_step: int = start_step
         self.batch_size: int = batch_size
-        self.world_size: int = world_size
         self.writer = writer
 
         self.init = False
         self.tic = 0
 
-    def __call__(self, global_step, loss: AverageMeter, epoch: int, fp16: bool, grad_scaler: torch.cuda.amp.GradScaler):
-        if self.rank is 0 and global_step > 0 and global_step % self.frequent == 0:
+    def __call__(self,
+                 global_step: int,
+                 loss: AverageMeter,
+                 epoch: int,
+                 fp16: bool,
+                 learning_rate: float,
+                 grad_scaler: torch.cuda.amp.GradScaler):
+        if self.rank == 0 and global_step > 0 and global_step % self.frequent == 0:
             if self.init:
                 try:
                     speed: float = self.frequent * self.batch_size / (time.time() - self.tic)
@@ -71,36 +85,32 @@ class CallBackLogging(object):
                 except ZeroDivisionError:
                     speed_total = float('inf')
 
-                time_now = (time.time() - self.time_start) / 3600
-                time_total = time_now / ((global_step + 1) / self.total_step)
-                time_for_end = time_total - time_now
+                #time_now = (time.time() - self.time_start) / 3600
+                #time_total = time_now / ((global_step + 1) / self.total_step)
+                #time_for_end = time_total - time_now
+                time_now = time.time()
+                time_sec = int(time_now - self.time_start)
+                time_sec_avg = time_sec / (global_step - self.start_step + 1)
+                eta_sec = time_sec_avg * (self.total_step - global_step - 1)
+                time_for_end = eta_sec/3600
                 if self.writer is not None:
                     self.writer.add_scalar('time_for_end', time_for_end, global_step)
+                    self.writer.add_scalar('learning_rate', learning_rate, global_step)
                     self.writer.add_scalar('loss', loss.avg, global_step)
                 if fp16:
-                    msg = "Speed %.2f samples/sec   Loss %.4f   Epoch: %d   Global Step: %d   "\
+                    msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
                           "Fp16 Grad Scale: %2.f   Required: %1.f hours" % (
-                        speed_total, loss.avg, epoch, global_step, grad_scaler.get_scale(), time_for_end
-                    )
+                              speed_total, loss.avg, learning_rate, epoch, global_step,
+                              grad_scaler.get_scale(), time_for_end
+                          )
                 else:
-                    msg = "Speed %.2f samples/sec   Loss %.4f   Epoch: %d   Global Step: %d   Required: %1.f hours" % (
-                        speed_total, loss.avg, epoch, global_step, time_for_end
-                    )
+                    msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
+                          "Required: %1.f hours" % (
+                              speed_total, loss.avg, learning_rate, epoch, global_step, time_for_end
+                          )
                 logging.info(msg)
                 loss.reset()
                 self.tic = time.time()
             else:
                 self.init = True
                 self.tic = time.time()
-
-
-class CallBackModelCheckpoint(object):
-    def __init__(self, rank, output="./"):
-        self.rank: int = rank
-        self.output: str = output
-
-    def __call__(self, global_step, backbone: torch.nn.Module, partial_fc: PartialFC = None):
-        if global_step > 100 and self.rank is 0:
-            torch.save(backbone.module.state_dict(), os.path.join(self.output, "backbone.pth"))
-        if global_step > 100 and partial_fc is not None:
-            partial_fc.save_params()
